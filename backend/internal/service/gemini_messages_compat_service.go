@@ -51,6 +51,7 @@ type GeminiMessagesCompatService struct {
 	tokenProvider             *GeminiTokenProvider
 	rateLimitService          *RateLimitService
 	httpUpstream              HTTPUpstream
+	geminiContextCache        GeminiContextCache
 	antigravityGatewayService *AntigravityGatewayService
 	cfg                       *config.Config
 	responseHeaderFilter      *responseheaders.CompiledHeaderFilter
@@ -76,6 +77,7 @@ func NewGeminiMessagesCompatService(
 	tokenProvider *GeminiTokenProvider,
 	rateLimitService *RateLimitService,
 	httpUpstream HTTPUpstream,
+	geminiContextCache GeminiContextCache,
 	antigravityGatewayService *AntigravityGatewayService,
 	cfg *config.Config,
 ) *GeminiMessagesCompatService {
@@ -87,6 +89,7 @@ func NewGeminiMessagesCompatService(
 		tokenProvider:             tokenProvider,
 		rateLimitService:          rateLimitService,
 		httpUpstream:              httpUpstream,
+		geminiContextCache:        geminiContextCache,
 		antigravityGatewayService: antigravityGatewayService,
 		cfg:                       cfg,
 		responseHeaderFilter:      compileResponseHeaderFilter(cfg),
@@ -614,6 +617,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 	var requestIDHeader string
 	var buildReq func(ctx context.Context) (*http.Request, string, error)
 	useUpstreamStream := req.Stream
+	cacheApply := geminiContextCacheApplyResult{}
 	if account.Type == AccountTypeOAuth && !req.Stream && strings.TrimSpace(account.GetCredential("project_id")) != "" {
 		// Code Assist's non-streaming generateContent may return no content; use streaming upstream and aggregate.
 		useUpstreamStream = true
@@ -642,8 +646,17 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 				fullURL += "?alt=sse"
 			}
 
-			restGeminiReq := normalizeGeminiRequestForAIStudio(geminiReq)
-			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(restGeminiReq))
+			requestBody := normalizeGeminiRequestForAIStudio(geminiReq)
+			var applied geminiContextCacheApplyResult
+			requestBody, applied = s.maybeApplyGeminiContextCache(ctx, account, mappedModel, requestBody, apiKey, normalizedBaseURL, proxyURL)
+			if applied.cacheCreationTokens > 0 {
+				cacheApply.cacheCreationTokens = applied.cacheCreationTokens
+				cacheApply.cacheCreationTTL = applied.cacheCreationTTL
+			}
+			if applied.cacheName != "" {
+				cacheApply.cacheName = applied.cacheName
+			}
+			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(requestBody))
 			if err != nil {
 				return nil, "", err
 			}
@@ -1079,6 +1092,11 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 		}
 	}
 
+	if usage == nil {
+		usage = &ClaudeUsage{}
+	}
+	applyGeminiContextCacheCreationUsage(usage, cacheApply)
+
 	// 图片生成计费
 	imageCount := 0
 	imageInputSize := s.extractImageInputSize(body)
@@ -1121,6 +1139,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	if len(body) == 0 {
 		return nil, s.writeGoogleError(c, http.StatusBadRequest, "Request body is empty")
 	}
+	originalBody := body
 
 	// 过滤掉 parts 为空的消息（Gemini API 不接受空 parts）
 	if filteredBody, err := filterEmptyPartsFromGeminiRequest(body); err == nil {
@@ -1159,6 +1178,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 
 	var requestIDHeader string
 	var buildReq func(ctx context.Context) (*http.Request, string, error)
+	cacheApply := geminiContextCacheApplyResult{}
 
 	switch account.Type {
 	case AccountTypeAPIKey:
@@ -1174,12 +1194,25 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 				return nil, "", err
 			}
 
+			requestBody := body
+			if action != "countTokens" {
+				var applied geminiContextCacheApplyResult
+				requestBody, applied = s.maybeApplyGeminiContextCache(ctx, account, mappedModel, requestBody, apiKey, normalizedBaseURL, proxyURL)
+				if applied.cacheCreationTokens > 0 {
+					cacheApply.cacheCreationTokens = applied.cacheCreationTokens
+					cacheApply.cacheCreationTTL = applied.cacheCreationTTL
+				}
+				if applied.cacheName != "" {
+					cacheApply.cacheName = applied.cacheName
+				}
+			}
+
 			fullURL := fmt.Sprintf("%s/v1beta/models/%s:%s", strings.TrimRight(normalizedBaseURL, "/"), mappedModel, upstreamAction)
 			if useUpstreamStream {
 				fullURL += "?alt=sse"
 			}
 
-			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(body))
+			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(requestBody))
 			if err != nil {
 				return nil, "", err
 			}
@@ -1604,10 +1637,11 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
+	applyGeminiContextCacheCreationUsage(usage, cacheApply)
 
 	// 图片生成计费
 	imageCount := 0
-	imageInputSize := s.extractImageInputSize(body)
+	imageInputSize := s.extractImageInputSize(originalBody)
 	imageSize := normalizeOpenAIImageSizeTier(imageInputSize)
 	if isImageGenerationModel(originalModel) {
 		imageCount = 1

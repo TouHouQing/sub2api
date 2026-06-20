@@ -104,12 +104,15 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 		useUpstreamStream = true
 	}
 
+	cacheApply := geminiContextCacheApplyResult{}
 	buildReq, requestIDHeader := s.buildGeminiChatCompletionsUpstreamRequestFunc(
 		account,
 		mappedModel,
 		geminiReq,
 		clientStream,
 		useUpstreamStream,
+		proxyURL,
+		&cacheApply,
 	)
 
 	var resp *http.Response
@@ -263,6 +266,7 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
+	applyGeminiContextCacheCreationUsage(usage, cacheApply)
 
 	imageCount := 0
 	imageInputSize := s.extractImageInputSize(claudeBody)
@@ -293,6 +297,8 @@ func (s *GeminiMessagesCompatService) buildGeminiChatCompletionsUpstreamRequestF
 	geminiReq []byte,
 	clientStream bool,
 	useUpstreamStream bool,
+	proxyURL string,
+	cacheApply *geminiContextCacheApplyResult,
 ) (func(context.Context) (*http.Request, string, error), string) {
 	switch account.Type {
 	case AccountTypeAPIKey:
@@ -317,8 +323,20 @@ func (s *GeminiMessagesCompatService) buildGeminiChatCompletionsUpstreamRequestF
 				fullURL += "?alt=sse"
 			}
 
-			restGeminiReq := normalizeGeminiRequestForAIStudio(geminiReq)
-			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(restGeminiReq))
+			requestBody := normalizeGeminiRequestForAIStudio(geminiReq)
+			var applied geminiContextCacheApplyResult
+			requestBody, applied = s.maybeApplyGeminiContextCache(ctx, account, mappedModel, requestBody, apiKey, normalizedBaseURL, proxyURL)
+			if cacheApply != nil {
+				if applied.cacheCreationTokens > 0 {
+					cacheApply.cacheCreationTokens = applied.cacheCreationTokens
+					cacheApply.cacheCreationTTL = applied.cacheCreationTTL
+				}
+				if applied.cacheName != "" {
+					cacheApply.cacheName = applied.cacheName
+				}
+			}
+
+			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(requestBody))
 			if err != nil {
 				return nil, "", err
 			}
