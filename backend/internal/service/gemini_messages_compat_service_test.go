@@ -996,6 +996,106 @@ func TestGeminiMessagesCompatServiceForward_APIKeyCachesLongSingleUserMessageFor
 	require.NotContains(t, string(streamBody), "stable single user message context")
 }
 
+func TestGeminiMessagesCompatServiceForward_APIKeyReusesStablePrefixCacheAcrossGrowingConversation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	createResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"name":"cachedContents/stable-prefix-cache","usageMetadata":{"totalTokenCount":18000}}`)),
+	}
+	firstStreamResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"candidates":[{"content":{"parts":[{"text":"first answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":18400,"cachedContentTokenCount":18000,"candidatesTokenCount":40}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}
+	secondStreamResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"candidates":[{"content":{"parts":[{"text":"second answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":18420,"cachedContentTokenCount":18000,"candidatesTokenCount":42}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}
+	httpStub := &geminiCompatHTTPUpstreamStub{responses: []*http.Response{createResp, firstStreamResp, secondStreamResp}}
+	cacheStore := &geminiContextCacheStoreStub{}
+	svc := &GeminiMessagesCompatService{
+		httpUpstream:       httpStub,
+		geminiContextCache: cacheStore,
+		cfg:                &config.Config{},
+	}
+	account := &Account{
+		ID:          86,
+		Platform:    PlatformGemini,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "test-key",
+		},
+	}
+
+	stableContext := strings.Repeat("stable uploaded document context ", 700)
+	firstUserContent := stableContext + "\n\n问题：第一轮只回答这个问题"
+	firstBody := []byte(fmt.Sprintf(`{
+		"model":"gemini-3.5-flash",
+		"max_tokens":64,
+		"stream":true,
+		"messages":[
+			{"role":"user","content":%q}
+		]
+	}`, firstUserContent))
+
+	firstRec := httptest.NewRecorder()
+	firstCtx, _ := gin.CreateTestContext(firstRec)
+	firstCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(firstBody))
+
+	firstResult, err := svc.Forward(context.Background(), firstCtx, account, firstBody)
+	require.NoError(t, err)
+	require.NotNil(t, firstResult)
+	require.Equal(t, 400, firstResult.Usage.InputTokens)
+	require.Equal(t, 18000, firstResult.Usage.CacheReadInputTokens)
+	require.Equal(t, 18000, firstResult.Usage.CacheCreationInputTokens)
+
+	secondBody := []byte(fmt.Sprintf(`{
+		"model":"gemini-3.5-flash",
+		"max_tokens":64,
+		"stream":true,
+		"messages":[
+			{"role":"user","content":%q},
+			{"role":"assistant","content":"first answer"},
+			{"role":"user","content":"第二轮问题，应该复用第一轮的长文档缓存"}
+		]
+	}`, firstUserContent))
+
+	secondRec := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRec)
+	secondCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(secondBody))
+
+	secondResult, err := svc.Forward(context.Background(), secondCtx, account, secondBody)
+	require.NoError(t, err)
+	require.NotNil(t, secondResult)
+	require.Equal(t, 420, secondResult.Usage.InputTokens)
+	require.Equal(t, 18000, secondResult.Usage.CacheReadInputTokens)
+	require.Zero(t, secondResult.Usage.CacheCreationInputTokens)
+
+	require.Len(t, cacheStore.set, 1)
+	require.Len(t, httpStub.requests, 3)
+	require.Contains(t, httpStub.requests[0].URL.String(), "/v1beta/cachedContents")
+	require.Contains(t, httpStub.requests[1].URL.String(), "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse")
+	require.Contains(t, httpStub.requests[2].URL.String(), "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse")
+
+	secondStreamBody, err := io.ReadAll(httpStub.requests[2].Body)
+	require.NoError(t, err)
+	require.Contains(t, string(secondStreamBody), `"cachedContent":"cachedContents/stable-prefix-cache"`)
+	require.Contains(t, string(secondStreamBody), "问题：第一轮只回答这个问题")
+	require.Contains(t, string(secondStreamBody), "first answer")
+	require.Contains(t, string(secondStreamBody), "第二轮问题，应该复用第一轮的长文档缓存")
+	require.NotContains(t, string(secondStreamBody), "stable uploaded document context")
+}
+
 func TestGeminiMessagesCompatServiceForward_APIKeyCachesLongSystemInstructionForStream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

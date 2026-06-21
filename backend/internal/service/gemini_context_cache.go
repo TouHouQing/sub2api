@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	defaultGeminiContextCacheTTL       = time.Hour
-	defaultGeminiContextCacheMinBytes  = 2048
-	defaultGeminiContextCacheTailChars = 4096
-	geminiContextCacheKeyPrefix        = "gemini-context-cache:v1"
+	defaultGeminiContextCacheTTL           = time.Hour
+	defaultGeminiContextCacheMinBytes      = 2048
+	defaultGeminiContextCacheTailChars     = 4096
+	defaultGeminiContextCacheCreateTimeout = 15 * time.Second
+	geminiContextCacheKeyPrefix            = "gemini-context-cache:v1"
 )
 
 var geminiContextCacheStableFields = []string{
@@ -51,10 +52,11 @@ type geminiContextCacheApplyResult struct {
 }
 
 type geminiContextCacheCandidate struct {
-	cacheKey    string
-	createBody  []byte
-	requestBody []byte
-	ttl         time.Duration
+	cacheKey          string
+	createBody        []byte
+	requestBody       []byte
+	ttl               time.Duration
+	cachePayloadBytes int
 }
 
 func (s *GeminiMessagesCompatService) maybeApplyGeminiContextCache(
@@ -77,31 +79,53 @@ func (s *GeminiMessagesCompatService) maybeApplyGeminiContextCache(
 
 	candidate, ok := buildGeminiContextCacheCandidate(account, model, body)
 	if !ok {
+		if len(body) >= geminiContextCacheMinBytes(account) {
+			logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache candidate skipped account=%d model=%s request_bytes=%d", account.ID, model, len(body))
+		}
 		return body, geminiContextCacheApplyResult{}
 	}
+	logger.LegacyPrintf(
+		"service.gemini_context_cache",
+		"Gemini context cache candidate account=%d model=%s key=%s cache_bytes=%d create_bytes=%d request_bytes=%d original_bytes=%d ttl=%s",
+		account.ID,
+		model,
+		shortGeminiContextCacheKey(candidate.cacheKey),
+		candidate.cachePayloadBytes,
+		len(candidate.createBody),
+		len(candidate.requestBody),
+		len(body),
+		candidate.ttl,
+	)
 
 	now := time.Now()
 	if entry, err := s.geminiContextCache.GetGeminiContextCache(ctx, candidate.cacheKey); err == nil && usableGeminiContextCacheEntry(entry, account.ID, model, now) {
 		rewritten, ok := injectGeminiCachedContent(candidate.requestBody, entry.Name)
 		if ok {
+			logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache hit account=%d model=%s key=%s name=%s", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), entry.Name)
 			return rewritten, geminiContextCacheApplyResult{cacheName: entry.Name}
 		}
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache hit could not be injected account=%d model=%s key=%s name=%s", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), entry.Name)
 	} else if err != nil {
-		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache lookup failed: %v", err)
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache lookup failed account=%d model=%s key=%s: %v", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), err)
 		return body, geminiContextCacheApplyResult{}
+	} else {
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache miss account=%d model=%s key=%s", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey))
 	}
 
+	createStart := time.Now()
 	entry, createTokens, err := s.createGeminiContextCache(ctx, account, apiKey, normalizedBaseURL, proxyURL, model, candidate)
 	if err != nil {
-		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache create skipped: %v", err)
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache create skipped account=%d model=%s key=%s elapsed=%s: %v", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), time.Since(createStart).Truncate(time.Millisecond), err)
 		return body, geminiContextCacheApplyResult{}
 	}
+	logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache created account=%d model=%s key=%s name=%s tokens=%d elapsed=%s", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), entry.Name, createTokens, time.Since(createStart).Truncate(time.Millisecond))
 
 	if err := s.geminiContextCache.SetGeminiContextCache(ctx, entry, time.Until(entry.ExpiresAt)); err != nil {
-		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache store failed: %v", err)
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache store failed account=%d model=%s key=%s: %v", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), err)
 	}
 	rewritten, ok := injectGeminiCachedContent(candidate.requestBody, entry.Name)
 	if !ok {
+		logger.LegacyPrintf("service.gemini_context_cache", "Gemini context cache create result could not be injected account=%d model=%s key=%s name=%s", account.ID, model, shortGeminiContextCacheKey(candidate.cacheKey), entry.Name)
 		return body, geminiContextCacheApplyResult{}
 	}
 	return rewritten, geminiContextCacheApplyResult{
@@ -131,37 +155,32 @@ func buildGeminiContextCacheCandidate(account *Account, model string, body []byt
 		return nil, false
 	}
 
-	cachePayload := make(map[string]any)
+	stablePayload := make(map[string]any)
 	requestPayload := cloneJSONMap(req)
 	for _, field := range geminiContextCacheStableFields {
 		if value, ok := req[field]; ok {
-			cachePayload[field] = value
+			stablePayload[field] = value
 			delete(requestPayload, field)
 		}
 	}
 
-	if rawContents, ok := req["contents"].([]any); ok && len(rawContents) > 1 {
-		prefixContents := cloneJSONSlice(rawContents[:len(rawContents)-1])
-		tailContents := cloneJSONSlice(rawContents[len(rawContents)-1:])
-		cachePayload["contents"] = prefixContents
-		requestPayload["contents"] = tailContents
-	} else if rawContents, ok := req["contents"].([]any); ok && len(rawContents) == 1 {
-		prefixContent, tailContent, ok := splitSingleGeminiContentParts(rawContents[0], geminiContextCacheTailChars(account))
+	cachePayload := cloneJSONMap(stablePayload)
+	if rawContents, ok := req["contents"].([]any); ok && len(rawContents) > 0 {
+		prefixContents, requestContents, ok := splitGeminiContentsForStableCache(rawContents, geminiContextCacheTailChars(account))
 		if ok {
-			cachePayload["contents"] = []any{prefixContent}
-			requestPayload["contents"] = []any{tailContent}
+			cachePayload["contents"] = prefixContents
+			requestPayload["contents"] = requestContents
 		}
 	}
 	if _, hasContents := cachePayload["contents"]; !hasContents && cachePayload["systemInstruction"] == nil {
 		return nil, false
 	}
 
-	minBytes := defaultGeminiContextCacheMinBytes
-	if account != nil {
-		if configured := account.getExtraInt("gemini_context_cache_min_bytes"); configured > 0 {
-			minBytes = configured
-		}
-	}
+	return makeGeminiContextCacheCandidate(account, model, cachePayload, requestPayload)
+}
+
+func makeGeminiContextCacheCandidate(account *Account, model string, cachePayload map[string]any, requestPayload map[string]any) (*geminiContextCacheCandidate, bool) {
+	minBytes := geminiContextCacheMinBytes(account)
 	createPayload := cloneJSONMap(cachePayload)
 	createPayload["model"] = geminiCachedContentModelName(model)
 	ttl := geminiContextCacheTTL(account)
@@ -183,11 +202,21 @@ func buildGeminiContextCacheCandidate(account *Account, model string, body []byt
 	sum := sha256.Sum256(cacheBytes)
 	cacheKey := fmt.Sprintf("%s:%d:%s:%s", geminiContextCacheKeyPrefix, account.ID, model, hex.EncodeToString(sum[:]))
 	return &geminiContextCacheCandidate{
-		cacheKey:    cacheKey,
-		createBody:  createBytes,
-		requestBody: requestBytes,
-		ttl:         ttl,
+		cacheKey:          cacheKey,
+		createBody:        createBytes,
+		requestBody:       requestBytes,
+		ttl:               ttl,
+		cachePayloadBytes: len(cacheBytes),
 	}, true
+}
+
+func geminiContextCacheMinBytes(account *Account) int {
+	if account != nil {
+		if configured := account.getExtraInt("gemini_context_cache_min_bytes"); configured > 0 {
+			return configured
+		}
+	}
+	return defaultGeminiContextCacheMinBytes
 }
 
 func geminiContextCacheTTL(account *Account) time.Duration {
@@ -206,6 +235,27 @@ func geminiContextCacheTailChars(account *Account) int {
 		}
 	}
 	return defaultGeminiContextCacheTailChars
+}
+
+func geminiContextCacheCreateTimeout(account *Account) time.Duration {
+	if account != nil {
+		if seconds := account.getExtraInt("gemini_context_cache_create_timeout_seconds"); seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return defaultGeminiContextCacheCreateTimeout
+}
+
+func shortGeminiContextCacheKey(key string) string {
+	parts := strings.Split(key, ":")
+	if len(parts) == 0 {
+		return ""
+	}
+	hash := parts[len(parts)-1]
+	if len(hash) > 12 {
+		return hash[:12]
+	}
+	return hash
 }
 
 func applyGeminiContextCacheCreationUsage(usage *ClaudeUsage, applied geminiContextCacheApplyResult) {
@@ -249,6 +299,12 @@ func (s *GeminiMessagesCompatService) createGeminiContextCache(
 	model string,
 	candidate *geminiContextCacheCandidate,
 ) (*GeminiContextCacheEntry, int, error) {
+	if timeout := geminiContextCacheCreateTimeout(account); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	fullURL := strings.TrimRight(baseURL, "/") + "/v1beta/cachedContents"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(candidate.createBody))
 	if err != nil {
@@ -264,7 +320,11 @@ func (s *GeminiMessagesCompatService) createGeminiContextCache(
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, 0, fmt.Errorf("upstream cachedContents returned %d: %s", resp.StatusCode, sanitizeUpstreamErrorMessage(strings.TrimSpace(string(respBody))))
+		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
+		if upstreamMsg == "" {
+			upstreamMsg = sanitizeUpstreamErrorMessage(truncateForLog(respBody, 512))
+		}
+		return nil, 0, fmt.Errorf("upstream cachedContents returned %d: %s", resp.StatusCode, upstreamMsg)
 	}
 
 	var parsed struct {
@@ -306,7 +366,37 @@ func injectGeminiCachedContent(body []byte, name string) ([]byte, bool) {
 	return out, true
 }
 
-func splitSingleGeminiContentParts(content any, tailChars int) (map[string]any, map[string]any, bool) {
+func splitGeminiContentsForStableCache(rawContents []any, tailChars int) ([]any, []any, bool) {
+	if len(rawContents) == 0 {
+		return nil, nil, false
+	}
+
+	allowTailFallback := len(rawContents) == 1
+	prefixContent, tailContent, ok := splitSingleGeminiContentParts(rawContents[0], tailChars, allowTailFallback)
+	if ok {
+		requestContents := make([]any, 0, len(rawContents))
+		requestContents = append(requestContents, tailContent)
+		requestContents = append(requestContents, cloneJSONSlice(rawContents[1:])...)
+		return []any{prefixContent}, requestContents, true
+	}
+
+	if len(rawContents) > 1 && geminiContentHasParts(rawContents[0]) {
+		return []any{cloneJSONValue(rawContents[0])}, cloneJSONSlice(rawContents[1:]), true
+	}
+
+	return nil, nil, false
+}
+
+func geminiContentHasParts(content any) bool {
+	contentMap, ok := content.(map[string]any)
+	if !ok {
+		return false
+	}
+	rawParts, ok := contentMap["parts"].([]any)
+	return ok && len(rawParts) > 0
+}
+
+func splitSingleGeminiContentParts(content any, tailChars int, allowFallback bool) (map[string]any, map[string]any, bool) {
 	contentMap, ok := content.(map[string]any)
 	if !ok {
 		return nil, nil, false
@@ -316,7 +406,10 @@ func splitSingleGeminiContentParts(content any, tailChars int) (map[string]any, 
 		return nil, nil, false
 	}
 	if len(rawParts) == 1 {
-		return splitSingleGeminiTextPart(contentMap, rawParts[0], tailChars)
+		return splitSingleGeminiTextPart(contentMap, rawParts[0], tailChars, allowFallback)
+	}
+	if !allowFallback {
+		return nil, nil, false
 	}
 
 	prefix := cloneJSONMap(contentMap)
@@ -326,7 +419,7 @@ func splitSingleGeminiContentParts(content any, tailChars int) (map[string]any, 
 	return prefix, tail, true
 }
 
-func splitSingleGeminiTextPart(contentMap map[string]any, rawPart any, tailChars int) (map[string]any, map[string]any, bool) {
+func splitSingleGeminiTextPart(contentMap map[string]any, rawPart any, tailChars int, allowFallback bool) (map[string]any, map[string]any, bool) {
 	partMap, ok := rawPart.(map[string]any)
 	if !ok {
 		return nil, nil, false
@@ -336,7 +429,7 @@ func splitSingleGeminiTextPart(contentMap map[string]any, rawPart any, tailChars
 		return nil, nil, false
 	}
 
-	splitIndex := chooseGeminiTextCacheSplitIndex(text, tailChars)
+	splitIndex := chooseGeminiTextCacheSplitIndex(text, tailChars, allowFallback)
 	if splitIndex <= 0 || splitIndex >= len([]rune(text)) {
 		return nil, nil, false
 	}
@@ -360,7 +453,7 @@ func splitSingleGeminiTextPart(contentMap map[string]any, rawPart any, tailChars
 	return prefix, tail, true
 }
 
-func chooseGeminiTextCacheSplitIndex(text string, tailChars int) int {
+func chooseGeminiTextCacheSplitIndex(text string, tailChars int, allowFallback bool) int {
 	runes := []rune(text)
 	if tailChars <= 0 {
 		tailChars = defaultGeminiContextCacheTailChars
@@ -389,6 +482,9 @@ func chooseGeminiTextCacheSplitIndex(text string, tailChars int) int {
 		}
 	}
 
+	if !allowFallback {
+		return -1
+	}
 	return len(runes) - tailChars
 }
 
