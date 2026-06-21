@@ -571,6 +571,8 @@ type ForwardResult struct {
 	ImageOutputSizes   []string
 	ImageSizeSource    string
 	ImageSizeBreakdown map[string]int
+
+	LocalCache GeminiLocalCacheResult
 }
 
 // UpstreamFailoverError indicates an upstream error that should trigger account failover.

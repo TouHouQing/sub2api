@@ -104,15 +104,12 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 		useUpstreamStream = true
 	}
 
-	cacheApply := geminiContextCacheApplyResult{}
 	buildReq, requestIDHeader := s.buildGeminiChatCompletionsUpstreamRequestFunc(
 		account,
 		mappedModel,
 		geminiReq,
 		clientStream,
 		useUpstreamStream,
-		proxyURL,
-		&cacheApply,
 	)
 
 	var resp *http.Response
@@ -266,7 +263,6 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
-	applyGeminiContextCacheCreationUsage(usage, cacheApply)
 
 	imageCount := 0
 	imageInputSize := s.extractImageInputSize(claudeBody)
@@ -274,6 +270,7 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 	if isImageGenerationModel(originalModel) {
 		imageCount = 1
 	}
+	localCache := s.trackGeminiLocalCache(ctx, account, mappedModel, geminiReq, usage)
 
 	return &ForwardResult{
 		RequestID:        requestID,
@@ -288,6 +285,7 @@ func (s *GeminiMessagesCompatService) forwardClaudeBodyAsChatCompletions(
 		ImageSize:        imageSize,
 		ImageInputSize:   imageInputSize,
 		ClientDisconnect: false,
+		LocalCache:       localCache,
 	}, nil
 }
 
@@ -297,8 +295,6 @@ func (s *GeminiMessagesCompatService) buildGeminiChatCompletionsUpstreamRequestF
 	geminiReq []byte,
 	clientStream bool,
 	useUpstreamStream bool,
-	proxyURL string,
-	cacheApply *geminiContextCacheApplyResult,
 ) (func(context.Context) (*http.Request, string, error), string) {
 	switch account.Type {
 	case AccountTypeAPIKey:
@@ -323,20 +319,8 @@ func (s *GeminiMessagesCompatService) buildGeminiChatCompletionsUpstreamRequestF
 				fullURL += "?alt=sse"
 			}
 
-			requestBody := normalizeGeminiRequestForAIStudio(geminiReq)
-			var applied geminiContextCacheApplyResult
-			requestBody, applied = s.maybeApplyGeminiContextCache(ctx, account, mappedModel, requestBody, apiKey, normalizedBaseURL, proxyURL)
-			if cacheApply != nil {
-				if applied.cacheCreationTokens > 0 {
-					cacheApply.cacheCreationTokens = applied.cacheCreationTokens
-					cacheApply.cacheCreationTTL = applied.cacheCreationTTL
-				}
-				if applied.cacheName != "" {
-					cacheApply.cacheName = applied.cacheName
-				}
-			}
-
-			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(requestBody))
+			restGeminiReq := normalizeGeminiRequestForAIStudio(geminiReq)
+			upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(restGeminiReq))
 			if err != nil {
 				return nil, "", err
 			}
