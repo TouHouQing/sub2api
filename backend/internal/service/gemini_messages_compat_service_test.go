@@ -922,6 +922,149 @@ func TestGeminiMessagesCompatServiceForward_APIKeyCreatesAndReadsExplicitContext
 	require.NotContains(t, string(streamBody), "system prompt stays cached")
 }
 
+func TestGeminiMessagesCompatServiceForward_APIKeyCachesLongSingleUserMessageForStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	createResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"name":"cachedContents/single-message-cache","usageMetadata":{"totalTokenCount":18000}}`)),
+	}
+	streamResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"candidates":[{"content":{"parts":[{"text":"single cached answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":18487,"cachedContentTokenCount":18000,"candidatesTokenCount":6}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}
+	httpStub := &geminiCompatHTTPUpstreamStub{responses: []*http.Response{createResp, streamResp}}
+	cacheStore := &geminiContextCacheStoreStub{}
+	svc := &GeminiMessagesCompatService{
+		httpUpstream:       httpStub,
+		geminiContextCache: cacheStore,
+		cfg:                &config.Config{},
+	}
+	account := &Account{
+		ID:          84,
+		Platform:    PlatformGemini,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "test-key",
+		},
+	}
+
+	prefix := strings.Repeat("stable single user message context ", 700)
+	body := []byte(fmt.Sprintf(`{
+		"model":"gemini-3.5-flash",
+		"max_tokens":64,
+		"stream":true,
+		"messages":[
+			{"role":"user","content":%q}
+		]
+	}`, prefix+"\n\n问题：这次只回答尾问"))
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Stream)
+	require.Equal(t, 487, result.Usage.InputTokens)
+	require.Equal(t, 6, result.Usage.OutputTokens)
+	require.Equal(t, 18000, result.Usage.CacheReadInputTokens)
+	require.Equal(t, 18000, result.Usage.CacheCreationInputTokens)
+	require.Len(t, httpStub.requests, 2)
+	require.Len(t, cacheStore.set, 1)
+
+	createReq := httpStub.requests[0]
+	require.Contains(t, createReq.URL.String(), "/v1beta/cachedContents")
+	createBody, err := io.ReadAll(createReq.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(createBody), "stable single user message context")
+	require.NotContains(t, string(createBody), "问题：这次只回答尾问")
+
+	streamReq := httpStub.requests[1]
+	require.Contains(t, streamReq.URL.String(), "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse")
+	streamBody, err := io.ReadAll(streamReq.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(streamBody), `"cachedContent":"cachedContents/single-message-cache"`)
+	require.Contains(t, string(streamBody), "问题：这次只回答尾问")
+	require.NotContains(t, string(streamBody), "stable single user message context")
+}
+
+func TestGeminiMessagesCompatServiceForward_APIKeyCachesLongSystemInstructionForStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	createResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"name":"cachedContents/system-cache","usageMetadata":{"totalTokenCount":17000}}`)),
+	}
+	streamResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"candidates":[{"content":{"parts":[{"text":"system cached answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":17221,"cachedContentTokenCount":17000,"candidatesTokenCount":5}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}
+	httpStub := &geminiCompatHTTPUpstreamStub{responses: []*http.Response{createResp, streamResp}}
+	cacheStore := &geminiContextCacheStoreStub{}
+	svc := &GeminiMessagesCompatService{
+		httpUpstream:       httpStub,
+		geminiContextCache: cacheStore,
+		cfg:                &config.Config{},
+	}
+	account := &Account{
+		ID:          85,
+		Platform:    PlatformGemini,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "test-key",
+		},
+	}
+
+	systemText := strings.Repeat("stable system only context ", 700)
+	body := []byte(fmt.Sprintf(`{
+		"model":"gemini-3.5-flash",
+		"max_tokens":64,
+		"stream":true,
+		"system":%q,
+		"messages":[
+			{"role":"user","content":"tail question"}
+		]
+	}`, systemText))
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 221, result.Usage.InputTokens)
+	require.Equal(t, 5, result.Usage.OutputTokens)
+	require.Equal(t, 17000, result.Usage.CacheReadInputTokens)
+	require.Equal(t, 17000, result.Usage.CacheCreationInputTokens)
+	require.Len(t, httpStub.requests, 2)
+
+	createBody, err := io.ReadAll(httpStub.requests[0].Body)
+	require.NoError(t, err)
+	require.Contains(t, string(createBody), "stable system only context")
+	require.Contains(t, string(createBody), `"systemInstruction"`)
+
+	streamBody, err := io.ReadAll(httpStub.requests[1].Body)
+	require.NoError(t, err)
+	require.Contains(t, string(streamBody), `"cachedContent":"cachedContents/system-cache"`)
+	require.Contains(t, string(streamBody), "tail question")
+	require.NotContains(t, string(streamBody), "stable system only context")
+}
+
 func TestGeminiMessagesCompatServiceForward_NormalizesWebSearchToolForAIStudio(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

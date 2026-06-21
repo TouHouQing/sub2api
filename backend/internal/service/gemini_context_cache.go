@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	defaultGeminiContextCacheTTL      = time.Hour
-	defaultGeminiContextCacheMinBytes = 2048
-	geminiContextCacheKeyPrefix       = "gemini-context-cache:v1"
+	defaultGeminiContextCacheTTL       = time.Hour
+	defaultGeminiContextCacheMinBytes  = 2048
+	defaultGeminiContextCacheTailChars = 4096
+	geminiContextCacheKeyPrefix        = "gemini-context-cache:v1"
 )
 
 var geminiContextCacheStableFields = []string{
@@ -145,14 +146,13 @@ func buildGeminiContextCacheCandidate(account *Account, model string, body []byt
 		cachePayload["contents"] = prefixContents
 		requestPayload["contents"] = tailContents
 	} else if rawContents, ok := req["contents"].([]any); ok && len(rawContents) == 1 {
-		prefixContent, tailContent, ok := splitSingleGeminiContentParts(rawContents[0])
+		prefixContent, tailContent, ok := splitSingleGeminiContentParts(rawContents[0], geminiContextCacheTailChars(account))
 		if ok {
 			cachePayload["contents"] = []any{prefixContent}
 			requestPayload["contents"] = []any{tailContent}
 		}
 	}
-
-	if len(cachePayload) == 0 {
+	if _, hasContents := cachePayload["contents"]; !hasContents && cachePayload["systemInstruction"] == nil {
 		return nil, false
 	}
 
@@ -197,6 +197,15 @@ func geminiContextCacheTTL(account *Account) time.Duration {
 		}
 	}
 	return defaultGeminiContextCacheTTL
+}
+
+func geminiContextCacheTailChars(account *Account) int {
+	if account != nil {
+		if configured := account.getExtraInt("gemini_context_cache_tail_chars"); configured > 0 {
+			return configured
+		}
+	}
+	return defaultGeminiContextCacheTailChars
 }
 
 func applyGeminiContextCacheCreationUsage(usage *ClaudeUsage, applied geminiContextCacheApplyResult) {
@@ -297,14 +306,17 @@ func injectGeminiCachedContent(body []byte, name string) ([]byte, bool) {
 	return out, true
 }
 
-func splitSingleGeminiContentParts(content any) (map[string]any, map[string]any, bool) {
+func splitSingleGeminiContentParts(content any, tailChars int) (map[string]any, map[string]any, bool) {
 	contentMap, ok := content.(map[string]any)
 	if !ok {
 		return nil, nil, false
 	}
 	rawParts, ok := contentMap["parts"].([]any)
-	if !ok || len(rawParts) <= 1 {
+	if !ok || len(rawParts) == 0 {
 		return nil, nil, false
+	}
+	if len(rawParts) == 1 {
+		return splitSingleGeminiTextPart(contentMap, rawParts[0], tailChars)
 	}
 
 	prefix := cloneJSONMap(contentMap)
@@ -312,6 +324,72 @@ func splitSingleGeminiContentParts(content any) (map[string]any, map[string]any,
 	prefix["parts"] = cloneJSONSlice(rawParts[:len(rawParts)-1])
 	tail["parts"] = cloneJSONSlice(rawParts[len(rawParts)-1:])
 	return prefix, tail, true
+}
+
+func splitSingleGeminiTextPart(contentMap map[string]any, rawPart any, tailChars int) (map[string]any, map[string]any, bool) {
+	partMap, ok := rawPart.(map[string]any)
+	if !ok {
+		return nil, nil, false
+	}
+	text, ok := partMap["text"].(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil, nil, false
+	}
+
+	splitIndex := chooseGeminiTextCacheSplitIndex(text, tailChars)
+	if splitIndex <= 0 || splitIndex >= len([]rune(text)) {
+		return nil, nil, false
+	}
+
+	runes := []rune(text)
+	prefixText := strings.TrimRight(string(runes[:splitIndex]), "\r\n")
+	tailText := strings.TrimLeft(string(runes[splitIndex:]), "\r\n")
+	if strings.TrimSpace(prefixText) == "" || strings.TrimSpace(tailText) == "" {
+		return nil, nil, false
+	}
+
+	prefixPart := cloneJSONMap(partMap)
+	tailPart := cloneJSONMap(partMap)
+	prefixPart["text"] = prefixText
+	tailPart["text"] = tailText
+
+	prefix := cloneJSONMap(contentMap)
+	tail := cloneJSONMap(contentMap)
+	prefix["parts"] = []any{prefixPart}
+	tail["parts"] = []any{tailPart}
+	return prefix, tail, true
+}
+
+func chooseGeminiTextCacheSplitIndex(text string, tailChars int) int {
+	runes := []rune(text)
+	if tailChars <= 0 {
+		tailChars = defaultGeminiContextCacheTailChars
+	}
+	if len(runes) <= tailChars {
+		return -1
+	}
+
+	windowStart := len(runes) - tailChars
+	if windowStart < 0 {
+		windowStart = 0
+	}
+	windowEnd := len(runes)
+	if windowEnd <= windowStart {
+		return len(runes) - tailChars
+	}
+
+	window := string(runes[windowStart:windowEnd])
+	for _, marker := range []string{
+		"\n\n问题", "\n\n提问", "\n\nQuestion", "\n\nQ:", "\n\nUser:", "\n\n用户",
+		"\n问题", "\n提问", "\nQuestion", "\nQ:", "\nUser:", "\n用户",
+		"\n\n",
+	} {
+		if idx := strings.LastIndex(window, marker); idx >= 0 {
+			return windowStart + len([]rune(window[:idx]))
+		}
+	}
+
+	return len(runes) - tailChars
 }
 
 func cloneJSONMap(in map[string]any) map[string]any {
