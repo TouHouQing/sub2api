@@ -15,13 +15,14 @@ import (
 // ──────────────────────────────────────────────────────────
 
 const (
-	EndpointMessages          = "/v1/messages"
-	EndpointChatCompletions   = "/v1/chat/completions"
-	EndpointEmbeddings        = "/v1/embeddings"
-	EndpointResponses         = "/v1/responses"
-	EndpointImagesGenerations = "/v1/images/generations"
-	EndpointImagesEdits       = "/v1/images/edits"
-	EndpointGeminiModels      = "/v1beta/models"
+	EndpointMessages           = "/v1/messages"
+	EndpointChatCompletions    = "/v1/chat/completions"
+	EndpointEmbeddings         = "/v1/embeddings"
+	EndpointResponses          = "/v1/responses"
+	EndpointImagesGenerations  = "/v1/images/generations"
+	EndpointImagesEdits        = "/v1/images/edits"
+	EndpointGeminiModels       = "/v1beta/models"
+	EndpointGeminiInteractions = "/v1beta/interactions"
 )
 
 // gin.Context keys used by the middleware and helpers below.
@@ -55,6 +56,8 @@ func NormalizeInboundEndpoint(path string) string {
 		return EndpointImagesEdits
 	case strings.Contains(path, EndpointResponses):
 		return EndpointResponses
+	case strings.Contains(path, EndpointGeminiInteractions):
+		return EndpointGeminiInteractions
 	case strings.Contains(path, EndpointGeminiModels):
 		return EndpointGeminiModels
 	default:
@@ -92,6 +95,9 @@ func DeriveUpstreamEndpoint(inbound, rawRequestPath, platform string) string {
 		return EndpointMessages
 
 	case service.PlatformGemini:
+		if inbound == EndpointGeminiInteractions {
+			return EndpointGeminiInteractions
+		}
 		return EndpointGeminiModels
 
 	case service.PlatformAntigravity:

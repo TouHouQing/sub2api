@@ -135,6 +135,22 @@ func TestExtractContentModerationInput_GeminiMultiTurnExtractsLatestUser(t *test
 	require.Equal(t, "Q2", input.Text)
 }
 
+func TestExtractContentModerationInput_GeminiInteractionsExtractsInputTextAndImage(t *testing.T) {
+	body := []byte(`{
+		"model": "gemini-3.1-flash-image",
+		"input": [
+			{"type":"text","text":"把车换成奥迪"},
+			{"type":"image","data":"iVBORw0KGgoAAA","mime_type":"image/png"}
+		],
+		"response_format": {"type":"image","mime_type":"image/png"}
+	}`)
+
+	input := ExtractContentModerationInput(ContentModerationProtocolGemini, body)
+
+	require.Equal(t, "把车换成奥迪", input.Text)
+	require.Equal(t, []string{"data:image/png;base64,iVBORw0KGgoAAA"}, input.Images)
+}
+
 func TestExtractContentModerationInput_ResponsesAgentToolLoopSkipsAudit(t *testing.T) {
 	body := []byte(`{
 		"input":[

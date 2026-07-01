@@ -2677,12 +2677,30 @@ func (s *GeminiMessagesCompatService) handleNativeStreamingResponse(c *gin.Conte
 //
 // This is used to support Gemini SDKs that call models listing endpoints before generation.
 func (s *GeminiMessagesCompatService) ForwardAIStudioGET(ctx context.Context, account *Account, path string) (*UpstreamHTTPResult, error) {
+	return s.forwardAIStudioHTTP(ctx, account, http.MethodGet, path, nil)
+}
+
+// ForwardAIStudioPOST forwards a JSON POST request to AI Studio
+// (generativelanguage.googleapis.com) for endpoints that are not model actions,
+// such as /v1beta/interactions.
+func (s *GeminiMessagesCompatService) ForwardAIStudioPOST(ctx context.Context, account *Account, path string, body []byte) (*UpstreamHTTPResult, error) {
+	if len(body) == 0 {
+		return nil, errors.New("request body is empty")
+	}
+	return s.forwardAIStudioHTTP(ctx, account, http.MethodPost, path, body)
+}
+
+func (s *GeminiMessagesCompatService) forwardAIStudioHTTP(ctx context.Context, account *Account, method string, path string, body []byte) (*UpstreamHTTPResult, error) {
 	if account == nil {
 		return nil, errors.New("account is nil")
 	}
 	path = strings.TrimSpace(path)
 	if path == "" || !strings.HasPrefix(path, "/") {
 		return nil, errors.New("invalid path")
+	}
+	method = strings.TrimSpace(method)
+	if method == "" {
+		return nil, errors.New("invalid method")
 	}
 
 	baseURL := account.GetGeminiBaseURL(geminicli.AIStudioBaseURL)
@@ -2697,9 +2715,16 @@ func (s *GeminiMessagesCompatService) ForwardAIStudioGET(ctx context.Context, ac
 		proxyURL = account.Proxy.URL()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, reader)
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	switch account.Type {
@@ -2728,7 +2753,7 @@ func (s *GeminiMessagesCompatService) ForwardAIStudioGET(ctx context.Context, ac
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	wwwAuthenticate := resp.Header.Get("Www-Authenticate")
 	filteredHeaders := responseheaders.FilterHeaders(resp.Header, s.responseHeaderFilter)
 	if wwwAuthenticate != "" {
@@ -2737,7 +2762,7 @@ func (s *GeminiMessagesCompatService) ForwardAIStudioGET(ctx context.Context, ac
 	return &UpstreamHTTPResult{
 		StatusCode: resp.StatusCode,
 		Headers:    filteredHeaders,
-		Body:       body,
+		Body:       respBody,
 	}, nil
 }
 
@@ -2847,6 +2872,104 @@ func extractGeminiUsage(data []byte) *ClaudeUsage {
 		CacheReadInputTokens: cached,
 		ImageOutputTokens:    imageTokens,
 	}
+}
+
+// ExtractGeminiUsageFromResponse exposes Gemini usage extraction for handlers
+// that proxy native Gemini JSON without going through ForwardNative.
+func ExtractGeminiUsageFromResponse(data []byte) *ClaudeUsage {
+	return extractGeminiUsage(data)
+}
+
+// IsImageGenerationModel reports whether a model is billed as an image
+// generation/edit model.
+func IsImageGenerationModel(model string) bool {
+	return isImageGenerationModel(model)
+}
+
+// NormalizeOpenAIImageSizeTier normalizes image size controls into billing tiers.
+func NormalizeOpenAIImageSizeTier(size string) string {
+	return normalizeOpenAIImageSizeTier(size)
+}
+
+// SetGeminiInteractionsModel replaces the model field in an interactions request.
+func SetGeminiInteractionsModel(body []byte, model string) []byte {
+	model = strings.TrimSpace(strings.TrimPrefix(model, "models/"))
+	if model == "" || len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	payload["model"] = model
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+// CountGeminiInteractionImages counts image outputs in common interactions
+// response shapes.
+func CountGeminiInteractionImages(body []byte) int {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return 0
+	}
+	count := 0
+	if hasGeminiInteractionImage(gjson.GetBytes(body, "output_image")) {
+		count++
+	}
+	if hasGeminiInteractionImage(gjson.GetBytes(body, "response.output_image")) {
+		count++
+	}
+	collectGeminiInteractionImages(gjson.GetBytes(body, "output"), &count)
+	collectGeminiInteractionImages(gjson.GetBytes(body, "steps"), &count)
+	return count
+}
+
+func collectGeminiInteractionImages(value gjson.Result, count *int) {
+	if !value.Exists() {
+		return
+	}
+	if hasGeminiInteractionImage(value) {
+		*count = *count + 1
+	}
+	switch {
+	case value.IsArray():
+		value.ForEach(func(_, item gjson.Result) bool {
+			collectGeminiInteractionImages(item, count)
+			return true
+		})
+	case value.IsObject():
+		collectGeminiInteractionImages(value.Get("content"), count)
+	}
+}
+
+func hasGeminiInteractionImage(value gjson.Result) bool {
+	if !value.Exists() || !value.IsObject() {
+		return false
+	}
+	typ := strings.ToLower(strings.TrimSpace(value.Get("type").String()))
+	return typ == "output_image" || typ == "image" || value.Get("data").String() != "" || value.Get("b64_json").String() != ""
+}
+
+// ExtractGeminiInteractionsImageInputSize extracts optional image size controls
+// from interactions requests.
+func ExtractGeminiInteractionsImageInputSize(body []byte) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+	for _, path := range []string{
+		"response_format.image_size",
+		"response_format.size",
+		"image_size",
+		"size",
+	} {
+		if v := strings.TrimSpace(gjson.GetBytes(body, path).String()); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func asInt(v any) (int, bool) {

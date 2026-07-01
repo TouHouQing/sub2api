@@ -28,6 +28,7 @@ func ExtractContentModerationInput(protocol string, body []byte) ContentModerati
 		collectLastResponsesInput(gjson.GetBytes(body, "input"), &parts, &images)
 	case ContentModerationProtocolGemini:
 		collectLastGeminiContent(gjson.GetBytes(body, "contents"), &parts, &images)
+		collectGeminiInteractionsInput(gjson.GetBytes(body, "input"), &parts, &images)
 	case ContentModerationProtocolOpenAIImages:
 		addModerationText(&parts, gjson.GetBytes(body, "prompt").String())
 		collectContentValue(gjson.GetBytes(body, "images"), &parts, &images)
@@ -198,6 +199,22 @@ func collectLastGeminiContent(contents gjson.Result, parts *[]string, images *[]
 	}
 	*parts = append(*parts, candidate...)
 	*images = append(*images, candidateImages...)
+}
+
+func collectGeminiInteractionsInput(input gjson.Result, parts *[]string, images *[]string) {
+	switch {
+	case !input.Exists():
+		return
+	case input.Type == gjson.String:
+		addModerationText(parts, input.String())
+	case input.IsArray():
+		input.ForEach(func(_, item gjson.Result) bool {
+			collectContentValue(item, parts, images)
+			return true
+		})
+	case input.IsObject():
+		collectContentValue(input, parts, images)
+	}
 }
 
 func collectContentValue(value gjson.Result, parts *[]string, images *[]string) {

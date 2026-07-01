@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -129,6 +130,187 @@ func (h *GatewayHandler) GeminiV1BetaGetModel(c *gin.Context) {
 		return
 	}
 	writeUpstreamResponse(c, res)
+}
+
+// GeminiV1BetaInteractions proxies:
+// POST /v1beta/interactions
+func (h *GatewayHandler) GeminiV1BetaInteractions(c *gin.Context) {
+	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+	if !ok || apiKey == nil {
+		googleError(c, http.StatusUnauthorized, "Invalid API key")
+		return
+	}
+	authSubject, ok := middleware.GetAuthSubjectFromContext(c)
+	if !ok {
+		googleError(c, http.StatusInternalServerError, "User context not found")
+		return
+	}
+	reqLog := requestLogger(
+		c,
+		"handler.gemini_v1beta.interactions",
+		zap.Int64("user_id", authSubject.UserID),
+		zap.Int64("api_key_id", apiKey.ID),
+		zap.Any("group_id", apiKey.GroupID),
+	)
+
+	if forcePlatform, hasForcePlatform := middleware.GetForcePlatformFromContext(c); hasForcePlatform {
+		if forcePlatform != service.PlatformGemini {
+			googleError(c, http.StatusBadRequest, "interactions endpoint is not supported for this platform")
+			return
+		}
+	} else {
+		if apiKey.Group == nil || apiKey.Group.Platform != service.PlatformGemini {
+			googleError(c, http.StatusBadRequest, "API key group platform is not gemini")
+			return
+		}
+	}
+
+	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
+	if err != nil {
+		if maxErr, ok := extractMaxBytesError(err); ok {
+			googleError(c, http.StatusRequestEntityTooLarge, buildBodyTooLargeMessage(maxErr.Limit))
+			return
+		}
+		googleError(c, http.StatusBadRequest, "Failed to read request body")
+		return
+	}
+	if len(body) == 0 {
+		googleError(c, http.StatusBadRequest, "Request body is empty")
+		return
+	}
+
+	modelName := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	modelName = strings.TrimPrefix(modelName, "models/")
+	if modelName == "" {
+		googleError(c, http.StatusBadRequest, "model is required")
+		return
+	}
+	reqLog = reqLog.With(zap.String("model", modelName))
+
+	setOpsRequestContext(c, modelName, false)
+	setOpsEndpointContext(c, "", int16(service.RequestTypeFromLegacy(false, false)))
+
+	if decision := h.checkContentModeration(c, reqLog, apiKey, authSubject, service.ContentModerationProtocolGemini, modelName, body); decision != nil && decision.Blocked {
+		googleError(c, contentModerationStatus(decision), decision.Message)
+		return
+	}
+
+	channelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(c.Request.Context(), apiKey.GroupID, modelName)
+	reqModel := modelName
+	if channelMapping.Mapped {
+		modelName = channelMapping.MappedModel
+		body = service.SetGeminiInteractionsModel(body, modelName)
+	}
+
+	subscription, _ := middleware.GetSubscriptionFromContext(c)
+
+	geminiConcurrency := NewConcurrencyHelper(h.concurrencyHelper.concurrencyService, SSEPingFormatNone, 0)
+	streamStarted := false
+	if h.errorPassthroughService != nil {
+		service.BindErrorPassthroughService(c, h.errorPassthroughService)
+	}
+	userReleaseFunc, err := geminiConcurrency.AcquireUserSlotWithWait(c, authSubject.UserID, authSubject.Concurrency, false, &streamStarted)
+	if err != nil {
+		reqLog.Warn("gemini_interactions.user_slot_acquire_failed", zap.Error(err))
+		googleError(c, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	userReleaseFunc = wrapReleaseOnDone(c.Request.Context(), userReleaseFunc)
+	if userReleaseFunc != nil {
+		defer userReleaseFunc()
+	}
+
+	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
+		reqLog.Info("gemini_interactions.billing_eligibility_check_failed", zap.Error(err))
+		status, _, message, retryAfter := billingErrorDetails(err)
+		if retryAfter > 0 {
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
+		}
+		googleError(c, status, message)
+		return
+	}
+
+	account, err := h.geminiCompatService.SelectAccountForAIStudioEndpoints(c.Request.Context(), apiKey.GroupID)
+	if err != nil {
+		markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
+		googleError(c, http.StatusServiceUnavailable, "No available Gemini accounts: "+err.Error())
+		return
+	}
+	setOpsSelectedAccount(c, account.ID, account.Platform)
+
+	accountReleaseFunc, err := geminiConcurrency.AcquireAccountSlotWithWait(c, account.ID, account.Concurrency, false, &streamStarted)
+	if err != nil {
+		reqLog.Warn("gemini_interactions.account_slot_acquire_failed", zap.Int64("account_id", account.ID), zap.Error(err))
+		googleError(c, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	accountReleaseFunc = wrapReleaseOnDone(c.Request.Context(), accountReleaseFunc)
+
+	res, err := h.geminiCompatService.ForwardAIStudioPOST(c.Request.Context(), account, "/v1beta/interactions", body)
+	if accountReleaseFunc != nil {
+		accountReleaseFunc()
+	}
+	if err != nil {
+		googleError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeUpstreamResponse(c, res)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return
+	}
+
+	usage := service.ExtractGeminiUsageFromResponse(res.Body)
+	if usage == nil {
+		usage = &service.ClaudeUsage{}
+	}
+	imageCount := service.CountGeminiInteractionImages(res.Body)
+	if imageCount == 0 && service.IsImageGenerationModel(modelName) {
+		imageCount = 1
+	}
+	result := &service.ForwardResult{
+		RequestID:     res.Headers.Get("x-request-id"),
+		Usage:         *usage,
+		Model:         reqModel,
+		UpstreamModel: modelName,
+		Stream:        false,
+		ImageCount:    imageCount,
+		ImageSize:     service.NormalizeOpenAIImageSizeTier(service.ExtractGeminiInteractionsImageInputSize(body)),
+	}
+
+	userAgent := c.GetHeader("User-Agent")
+	clientIP := ip.GetClientIP(c)
+	requestPayloadHash := service.HashUsageRequestPayload(body)
+	inboundEndpoint := GetInboundEndpoint(c)
+	upstreamEndpoint := GetUpstreamEndpoint(c, account.Platform)
+	quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
+	h.submitUsageRecordTask(c.Request.Context(), func(ctx context.Context) {
+		if err := h.gatewayService.RecordUsageWithLongContext(ctx, &service.RecordUsageLongContextInput{
+			Result:                result,
+			QuotaPlatform:         quotaPlatform,
+			APIKey:                apiKey,
+			User:                  apiKey.User,
+			Account:               account,
+			Subscription:          subscription,
+			InboundEndpoint:       inboundEndpoint,
+			UpstreamEndpoint:      upstreamEndpoint,
+			UserAgent:             userAgent,
+			IPAddress:             clientIP,
+			RequestPayloadHash:    requestPayloadHash,
+			LongContextThreshold:  200000,
+			LongContextMultiplier: 2.0,
+			APIKeyService:         h.apiKeyService,
+			ChannelUsageFields:    channelMapping.ToUsageFields(reqModel, result.UpstreamModel),
+		}); err != nil {
+			logger.L().With(
+				zap.String("component", "handler.gemini_v1beta.interactions"),
+				zap.Int64("user_id", authSubject.UserID),
+				zap.Int64("api_key_id", apiKey.ID),
+				zap.Any("group_id", apiKey.GroupID),
+				zap.String("model", modelName),
+				zap.Int64("account_id", account.ID),
+			).Error("gemini_interactions.record_usage_failed", zap.Error(err))
+		}
+	})
 }
 
 // GeminiV1BetaModels proxies Gemini native REST endpoints like:

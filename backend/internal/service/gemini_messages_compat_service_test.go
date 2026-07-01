@@ -180,6 +180,48 @@ func TestGeminiForwardAsChatCompletions_StreamsOpenAIChunksFromGeminiSSE(t *test
 	require.Contains(t, out, "data: [DONE]")
 }
 
+func TestGeminiMessagesCompatServiceForwardAIStudioPOST_APIKeyForwardsInteractions(t *testing.T) {
+	httpStub := &geminiCompatHTTPUpstreamStub{
+		response: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"req_123"}},
+			Body:       io.NopCloser(strings.NewReader(`{"output_image":{"data":"iVBORw0KGgo","mime_type":"image/png"},"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7}}`)),
+		},
+	}
+	svc := &GeminiMessagesCompatService{
+		httpUpstream: httpStub,
+		cfg:          &config.Config{},
+	}
+	account := &Account{
+		ID:       202,
+		Platform: PlatformGemini,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "gemini-api-key",
+			"base_url": "https://ai.example.test",
+		},
+		Concurrency: 1,
+	}
+	body := []byte(`{"model":"gemini-3.1-flash-image","input":[{"type":"text","text":"edit"},{"type":"image","data":"abc","mime_type":"image/png"}],"response_format":{"type":"image"}}`)
+
+	res, err := svc.ForwardAIStudioPOST(context.Background(), account, "/v1beta/interactions", body)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, http.StatusOK, res.StatusCode)
+	require.JSONEq(t, `{"output_image":{"data":"iVBORw0KGgo","mime_type":"image/png"},"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7}}`, string(res.Body))
+
+	require.Equal(t, 1, httpStub.calls)
+	require.NotNil(t, httpStub.lastReq)
+	require.Equal(t, http.MethodPost, httpStub.lastReq.Method)
+	require.Equal(t, "https://ai.example.test/v1beta/interactions", httpStub.lastReq.URL.String())
+	require.Equal(t, "application/json", httpStub.lastReq.Header.Get("Content-Type"))
+	require.Equal(t, "gemini-api-key", httpStub.lastReq.Header.Get("x-goog-api-key"))
+
+	sentBody, err := io.ReadAll(httpStub.lastReq.Body)
+	require.NoError(t, err)
+	require.Equal(t, string(body), string(sentBody))
+}
+
 // TestConvertClaudeToolsToGeminiTools_CustomType 测试custom类型工具转换
 func TestConvertClaudeToolsToGeminiTools_CustomType(t *testing.T) {
 	tests := []struct {
